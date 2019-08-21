@@ -71,26 +71,6 @@ func (umm *UMM) data(b int) unsafe.Pointer { return unsafe.Pointer(&umm.heap[b].
 func (umm *UMM) lock()                     { umm.mutex.Lock() }
 func (umm *UMM) unlock()                   { umm.mutex.Unlock() }
 
-func (umm *UMM) blocks(size uintptr) int {
-	// The calculation of the block size is not too difficult, but there are
-	// a few little things that we need to be mindful of.
-	//
-	// When a block removed from the free list, the space used by the free
-	// pointers is available for data. That's what the first calculation
-	// of size is doing.
-
-	if size <= unsafe.Sizeof(block{}.body) {
-		return 1
-	}
-
-	// If it's for more than that, then we need to figure out the number of
-	// additional whole blocks the size of an block are required.
-
-	size -= 1 + unsafe.Sizeof(block{}.body)
-
-	return int(2 + size/unsafe.Sizeof(block{}))
-}
-
 // Split the block `c` into two blocks: `c` and `c + blocks`.
 //
 // - `new_freemask` should be `0` if `c + blocks` used, or `_FREELIST_MASK`
@@ -210,7 +190,7 @@ func (umm *UMM) Free(p unsafe.Pointer) {
 	umm.assimilateUp(c)
 
 	// Then assimilate with the previous block if possible
-	if (umm.nblock(umm.pblock(c)) & _FREELIST_MASK) != 0 {
+	if umm.nblock(umm.pblock(c))&_FREELIST_MASK != 0 {
 		c = umm.assimilateDown(c, _FREELIST_MASK)
 	} else {
 		// The previous block is not a free block, so add this one to the head
@@ -226,8 +206,28 @@ func (umm *UMM) Free(p unsafe.Pointer) {
 	umm.unlock()
 }
 
-// Malloc returns uintptr to force to use of unsafe package to use allocated memory.
-func (umm *UMM) Malloc(size uintptr) (p uintptr) {
+func (umm *UMM) blocks(size uintptr) int {
+	// The calculation of the block size is not too difficult, but there are
+	// a few little things that we need to be mindful of.
+	//
+	// When a block removed from the free list, the space used by the free
+	// pointers is available for data. That's what the first calculation
+	// of size is doing.
+
+	if size <= unsafe.Sizeof(block{}.body) {
+		return 1
+	}
+
+	// If it's for more than that, then we need to figure out the number of
+	// additional whole blocks the size of an block are required.
+
+	size -= 1 + unsafe.Sizeof(block{}.body)
+
+	return int(2 + size/unsafe.Sizeof(block{}))
+}
+
+// Calloc returns uintptr to force to use of unsafe package to use allocated memory.
+func (umm *UMM) Malloc(size uintptr, needzero bool) (p uintptr) {
 	if size == 0 {
 		return 0
 	}
@@ -236,39 +236,32 @@ func (umm *UMM) Malloc(size uintptr) (p uintptr) {
 
 	umm.lock()
 
-	cf := umm.nfree(0)
-	bestBlock := cf
-	blockSize := 0
-	bestSize := 0x7FFF
+	bestBlock := 0
+	bestSize := 0x8000
 
-	for cf != 0 {
-		blockSize = (umm.nblock(cf) & _BLOCKNO_MASK) - cf
+	for cf := umm.nfree(0); cf != 0; cf = umm.nfree(cf) {
+		blockSize := (umm.nblock(cf) & _BLOCKNO_MASK) - cf
 		if blockSize >= blocks && blockSize < bestSize {
 			bestBlock = cf
 			bestSize = blockSize
 		}
-		cf = umm.nfree(cf)
-	}
-	if bestSize != 0x7FFF {
-		cf = bestBlock
-		blockSize = bestSize
 	}
 
-	if umm.nblock(cf)&_BLOCKNO_MASK != 0 && blockSize >= blocks {
+	if bestBlock != 0 && umm.nblock(bestBlock)&_BLOCKNO_MASK != 0 {
 		// This is an existing block in the memory heap, we just need to split off
 		// what we need, unlink it from the free list and mark it as in use, and
 		// link the rest of the block back into the freelist as if it was a new
 		// block on the free list...
 
-		if blockSize == blocks {
+		if bestSize == blocks {
 			// It's an exact fit and we don't neet to split off a block.
 			// Disconnect this block from the FREE list
-			umm.disconnectFromFreeList(cf)
+			umm.disconnectFromFreeList(bestBlock)
 		} else {
 			// It's not an exact fit and we need to split off a block.
 			// split current free block `cf` into two blocks. The first one will be
 			// returned to user, so it's not free, and the second one will be free.
-			umm.splitBlock(cf, blocks, _FREELIST_MASK)
+			umm.splitBlock(bestBlock, blocks, _FREELIST_MASK)
 
 			// `umm_split_block()` does not update the free pointers (it affects
 			// only free flags), but effectively we've just moved beginning of the
@@ -276,17 +269,34 @@ func (umm *UMM) Malloc(size uintptr) (p uintptr) {
 			// to and from adjacent free blocks.
 
 			// previous free block
-			umm.setnfree(umm.pfree(cf), cf+blocks)
-			umm.setpfree(cf+blocks, umm.pfree(cf))
+			umm.setnfree(umm.pfree(bestBlock), bestBlock+blocks)
+			umm.setpfree(bestBlock+blocks, umm.pfree(bestBlock))
 
 			// next free block
-			umm.setpfree(umm.nfree(cf), cf+blocks)
-			umm.setnfree(cf+blocks, umm.nfree(cf))
+			umm.setpfree(umm.nfree(bestBlock), bestBlock+blocks)
+			umm.setnfree(bestBlock+blocks, umm.nfree(bestBlock))
 		}
-		p = uintptr(umm.data(cf))
+		p = uintptr(umm.data(bestBlock))
 	}
 
 	umm.unlock()
 
+	if p != 0 && needzero {
+		// clear memory
+		var zero block
+		umm.heap[bestBlock].body = zero.body
+		for i := 1; i < blocks; i++ {
+			umm.heap[bestBlock+i] = zero
+		}
+	}
+
+	return
+}
+
+func (umm *UMM) BlockInfo(current int) (size int, used bool) {
+	next := umm.nblock(current)
+	used = next&_FREELIST_MASK == 0
+	next &^= _FREELIST_MASK
+	size = next - current
 	return
 }
